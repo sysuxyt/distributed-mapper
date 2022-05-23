@@ -18,13 +18,16 @@
 #include <gtsam/slam/InitializePose3.h>
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/inference/graph.h>
+#include <gtsam/nonlinear/ISAM2.h>
 
 namespace distributed_mapper{
 
 
 // Static Consts
+static const gtsam::Matrix I9 = gtsam::eye(9);
+static const gtsam::Vector zero9 = gtsam::Vector::Zero(9);
 static const size_t maxIter_ = 1000;
-static const gtsam::Key keyAnchor = 99999999;
+static const gtsam::Key keyAnchor = gtsam::symbol('Z', 9999999);
 
 /**
  * @brief The DistributedMapper class runs distributed mapping algorithm
@@ -59,6 +62,12 @@ class DistributedMapper{
       useBetweenNoise_ = false;
       useLandmarks_ = false;
       latestChange_ = DBL_MAX;
+      
+      gtsam::ISAM2Params parameters;
+      parameters.relinearizeThreshold = 0.01;
+      parameters.relinearizeSkip = 1;
+      isam_ = new gtsam::ISAM2(parameters);
+      mark = 0;
     }
 
 
@@ -111,9 +120,96 @@ class DistributedMapper{
       graph_.push_back(factor);
       innerEdges_.add(factor);
       chordalGraph_.add(factor);
+      // incGraph_.push_back(factor);//isam
       // recreate orientation graph of inner edges, this time with prior (included in innerEdges_)
       createLinearOrientationGraph();
     }
+    void create_copy(){
+      // incGraph_ = graph_;
+      incGraph_ = innerEdges_;
+      incInitial_ = initial_;
+    }
+    void addFactor_isam(gtsam::NonlinearFactor::shared_ptr& factor){
+        incGraph_.push_back(factor);
+    }
+    void insertValue_isam(gtsam::Key key, gtsam::Pose3 pose){
+      if(incInitial_.exists(key)){
+        incInitial_.update(key, pose);
+      }
+      else{
+        incInitial_.insert(key, pose);
+      }
+    }
+    void addValuesFromCopy(int last_saved_index){
+        gtsam::Pose3 between;
+        for(const gtsam::Values::KeyValuePair& key_value: incInitial_) {
+          gtsam::Symbol key = key_value.key;
+          int index = gtsam::symbolIndex(key);
+          if(index == last_saved_index){
+            gtsam::Pose3 poseFrom = incInitial_.at<gtsam::Pose3>(key);
+            gtsam::Pose3 poseTo = initial_.at<gtsam::Pose3>(key);          
+            between = poseFrom.between(poseTo);  
+          }
+          if(index > last_saved_index){
+            if(!initial_.exists(key)){
+              initial_.insert(key, between * incInitial_.at<gtsam::Pose3>(key));//to do 加上last_saved_index的delta_transform
+            }
+          }
+        }
+        linearizedRotation_ = multirobot_util::rowMajorVectorValues(initial_);
+        // linearizedPoses_ = multirobot_util::initializeVectorValues(initial_); //初始化啊哈哈哈
+    }
+    void addFactorFromCopy(int last_saved_index){
+      for(size_t k=0; k < incGraph_.size(); k++){
+        // if(k == 0 && robotName_ == 'a'){
+        //   std::cout<<"Do not remove prior0 of robot0"<<std::endl;
+        //   continue;
+        // }
+        if(!incGraph_.at(k))continue;
+        gtsam::KeyVector keys = incGraph_.at(k)->keys();
+        if(keys.size() != 2)continue;
+        if(gtsam::symbolChr(keys.at(0)) == gtsam::symbolChr(keys.at(1))){
+          if (gtsam::symbolIndex(keys.at(0))>last_saved_index || gtsam::symbolIndex(keys.at(1))>last_saved_index ) {
+            if(gtsam::symbolIndex(keys.at(0))==last_saved_index){
+              std::cout<<"*************"<<std::endl;
+            }
+            if(gtsam::symbolIndex(keys.at(1))==last_saved_index){
+              std::cout<<"*************"<<std::endl;
+            }
+            graph_.push_back(incGraph_.at(k));
+            innerEdges_.push_back(incGraph_.at(k));
+
+            // Chordal factor
+            boost::shared_ptr<gtsam::BetweenFactor<gtsam::Pose3> > between =
+                boost::dynamic_pointer_cast<gtsam::BetweenFactor<gtsam::Pose3> >(incGraph_.at(k));
+            gtsam::Key key1 = between->keys().at(0);
+            gtsam::Key key2 = between->keys().at(1);
+            gtsam::Pose3 measured = between->measured();
+            chordalGraph_.add(gtsam::BetweenChordalFactor<gtsam::Pose3>(key1, key2, measured, poseNoiseModel_));
+
+            // Linear orientation graph
+            createLinearOrientationGraph(); // TODO: Rebuilds entire linear orientation graph everytime a factor is added
+
+          }
+        }
+        else{
+          // if(gtsam::symbolChr(keys.at(0)) == robotName_ && gtsam::symbolIndex(keys.at(0))>last_saved_index){
+          //   graph_.push_back(incGraph_.at(k));
+          //   separatorEdgeIds_.push_back(graph_.size() -1);
+          // }
+          // if(gtsam::symbolChr(keys.at(1)) == robotName_  && gtsam::symbolIndex(keys.at(1)) > last_saved_index){
+          //   graph_.push_back(incGraph_.at(k));
+          //   separatorEdgeIds_.push_back(graph_.size() -1);
+          // }
+          std::cout<<"Something wrong, sepEdges in incGraph!!"<<std::endl;
+        }
+      }
+      // Clear traces
+      rotationErrorTrace_.clear();
+      poseErrorTrace_.clear();
+    }
+
+
 
     /** @brief removePrior removes the prior factor in the graph  */
     void
@@ -122,18 +218,45 @@ class DistributedMapper{
         if(!graph_.at(k))continue;
         gtsam::KeyVector keys = graph_.at(k)->keys();
         if (keys.size() != 2){
+          if(k == 0 && robotName_ == 'a'){
+            std::cout<<"Do not remove prior0 of robot0"<<std::endl;
+            std::cout<<gtsam::symbolChr(keys.at(0))<<" "<<gtsam::symbolIndex(keys.at(0))<<std::endl;
+            continue;
+          }
           boost::shared_ptr<gtsam::PriorFactor<gtsam::Pose3> > pose3Prior =
               boost::dynamic_pointer_cast<gtsam::PriorFactor<gtsam::Pose3> >(graph_.at(k));
           if (pose3Prior){
+            std::cout<<"remove prior"<<k<<std::endl;
             graph_.remove(k);
+            // innerEdges_.remove(k);
+            // chordalGraph_.remove(k);
+            // createLinearOrientationGraph(); // linear orientation graph
+            // break;
+          }
+        }
+      }
+      for(size_t k=0; k < innerEdges_.size(); k++){
+        if(!innerEdges_.at(k))continue;
+        gtsam::KeyVector keys = innerEdges_.at(k)->keys();
+        if (keys.size() != 2){
+          if(k == 0 && robotName_ == 'a'){
+            std::cout<<"Do not remove prior0 of robot0"<<std::endl;
+            std::cout<<gtsam::symbolChr(keys.at(0))<<" "<<gtsam::symbolIndex(keys.at(0))<<std::endl;
+            continue;
+          }
+          boost::shared_ptr<gtsam::PriorFactor<gtsam::Pose3> > pose3Prior =
+              boost::dynamic_pointer_cast<gtsam::PriorFactor<gtsam::Pose3> >(innerEdges_.at(k));
+          if (pose3Prior){
+            std::cout<<"remove prior"<<k<<std::endl;
             innerEdges_.remove(k);
             chordalGraph_.remove(k);
             createLinearOrientationGraph(); // linear orientation graph
-            break;
+            // break;
           }
         }
       }
     }
+
 
     /** @brief chordalFactorGraph generates a graph of BetweenChordalFactors using innerEdges required for distributed pose estimation*/
     void chordalFactorGraph();
@@ -173,13 +296,24 @@ class DistributedMapper{
         initial_.insert(key, pose);
       }
       linearizedRotation_ = multirobot_util::rowMajorVectorValues(initial_);
+      // linearizedPoses_ = multirobot_util::initializeVectorValues(initial_); //初始化啊哈哈哈
+      // incInitial_.insert(key, pose);//isam
     }
+  
+      /**
+     * @brief insertValue updates inneer nodes with the new value
+     * @param sym is symbol
+     * @param pose is the pose
+     */
+
 
     /**removePrior
      * @brief updateGraph adds new factor to the graph
      * @param factor is the input factor
      */
     void addFactor(gtsam::NonlinearFactor::shared_ptr& factor){
+      //isam
+      // incGraph_.push_back(factor);
       graph_.push_back(factor);
       gtsam::KeyVector keys = factor->keys();
       if(gtsam::symbolChr(keys.at(0)) == gtsam::symbolChr(keys.at(1))){
@@ -205,6 +339,7 @@ class DistributedMapper{
       poseErrorTrace_.clear();
     }
 
+
     /**
      * @brief updateNeighbor updates neighboring nodes with the new value
      * @param sym is symbol
@@ -217,7 +352,7 @@ class DistributedMapper{
       }
       else{
         neighbors_.insert(key, pose);
-        neighborsLinearizedPoses_.insert(key, gtsam::Matrix::Zero(6, 6));
+        neighborsLinearizedPoses_.insert(key, gtsam::zero(6));
         gtsam::Matrix3 R = pose.rotation().matrix();
         gtsam::Vector r = multirobot_util::rowMajorVector(R);
         neighborsLinearizedRotations_.insert(key, r);
@@ -285,11 +420,107 @@ class DistributedMapper{
 
     }
 
+    void convertLinearizedRotationToPoses2(){
+      gtsam::Values rotValue = gtsam::InitializePose3::normalizeRelaxedRotations(linearizedRotation_);
+      initial_ = multirobot_util::pose3WithZeroTranslation(rotValue, initial_);
+      linearizedPoses_ = multirobot_util::initializeVectorValues(initial_); // Init linearized poses
+      distGFG_ = *(chordalGraph_.linearize(initial_));
+
+      // Initial error
+      //double error = distGFG_.error(linearizedPoses_);
+      //poseErrorTrace_.push_back(error);
+
+    }
+
     /** @brief estimateAt returns the current estimate at sym */
     gtsam::Pose3 estimateAt(gtsam::Key key){ return initial_.at<gtsam::Pose3>(key); }
 
     /** @brief returns the current estimate */
-    gtsam::Values currentEstimate(){ return initial_; }
+    gtsam::Values currentEstimate(){ return initial_; }//原先是initial_
+    gtsam::Values currentEstimate_isam(){ return incInitial_; }
+
+    void optimization_LM(){//to do 直接改成用incInitial_好像更合适。insert新加值到initial后再赋值回incInitial_
+      // isam_->update(incGraph_, incInitial_);
+      // isam_->update();
+      // incGraph_.resize(0);
+      // incInitial_.clear();
+      initial_ = gtsam::LevenbergMarquardtOptimizer(innerEdges_, initial_).optimize();
+      // incInitial_ = initial_;
+      // initial_ = isam_->calculateEstimate();
+    }
+    void optimization_LM2(){//to do 直接改成用incInitial_好像更合适。insert新加值到initial后再赋值回incInitial_
+      // isam_->update(incGraph_, incInitial_);
+      // isam_->update();
+      // incGraph_.resize(0);
+      // incInitial_.clear();
+      incInitial_ = gtsam::LevenbergMarquardtOptimizer(incGraph_, incInitial_).optimize();
+      // initial_ = isam_->calculateEstimate();
+    }
+
+
+    void update_priors(){
+      // remove_old_priors
+      // for(size_t k=0; k < incGraph_.size(); k++){
+      //   // if(k == 0 && robotName_ == 'a'){
+      //   //   std::cout<<"Do not remove prior0 of robot0"<<std::endl;
+      //   //   continue;
+      //   // }
+      //   if(!incGraph_.at(k))continue;
+      //   gtsam::KeyVector keys = incGraph_.at(k)->keys();
+      //   if (keys.size() != 2){
+      //     boost::shared_ptr<gtsam::PriorFactor<gtsam::Pose3> > pose3Prior =
+      //         boost::dynamic_pointer_cast<gtsam::PriorFactor<gtsam::Pose3> >(incGraph_.at(k));
+      //     if (pose3Prior){
+      //       incGraph_.remove(k);
+      //     }
+      //   }
+      // }
+      // add new priors
+      for(size_t s = 0 ; s < separatorEdgeIds_.size(); s++){ 
+        size_t sepSlot =  separatorEdgeIds_[s];
+        boost::shared_ptr<gtsam::BetweenFactor<gtsam::Pose3> > pose3Between =
+            boost::dynamic_pointer_cast<gtsam::BetweenFactor<gtsam::Pose3> >(graph_.at(sepSlot));
+
+        // Construct between chordal factor corresponding to separator edges
+        gtsam::KeyVector keys = pose3Between->keys();
+        gtsam::Symbol key0 = keys.at(0);
+        gtsam::Symbol key1 = keys.at(1);
+        if(gtsam::symbolChr(key0) == robotName_){
+          addPrior(key0, estimateAt(key0), pose3Between->get_noiseModel());
+          // break;
+        }
+        if(gtsam::symbolChr(key1) == robotName_){
+          addPrior(key1, estimateAt(key1), pose3Between->get_noiseModel());
+          // break;
+        }
+      }
+      // int mark = separatorEdgeIds_.size();
+      // createLinearOrientationGraph();
+    }
+
+    void refresh_isam(gtsam::Symbol sym,  gtsam::Pose3 priorPose, const gtsam::SharedNoiseModel& priorModel){
+      
+      gtsam::NonlinearFactorGraph::shared_ptr tempGraph(new gtsam::NonlinearFactorGraph);
+      *tempGraph = isam_->getFactorsUnsafe().clone();
+      gtsam::NonlinearFactor::shared_ptr replace_prior(new gtsam::PriorFactor<gtsam::Pose3>(sym, priorPose, priorModel));
+      tempGraph->replace(0, replace_prior);
+
+      gtsam::FactorIndices rm;
+      for(int idx=0; idx<isam_->getFactorsUnsafe().size(); idx++){
+          rm.push_back(idx);
+      }
+      isam_->clear();
+      isam_->update(gtsam::NonlinearFactorGraph(), gtsam::Values(), rm);
+
+      isam_->update(*tempGraph, initial_);
+      isam_->update();
+
+      gtsam::PriorFactor<gtsam::Pose3>::shared_ptr edge = boost::dynamic_pointer_cast<gtsam::PriorFactor<gtsam::Pose3>>(isam_->getFactorsUnsafe().at(0));
+      if(!edge){
+        std::cerr << "no prior" <<std::endl;
+      }
+
+    }
 
     /** @brief returns the robot name */
     char robotName(){ return robotName_; }
@@ -456,7 +687,7 @@ class DistributedMapper{
 
     char robotName_;// Key for each robot
     gtsam::NonlinearFactorGraph graph_; // subgraph corresponding to each robot
-    gtsam::Values initial_; // subinitials corresponding to each robot
+    gtsam::Values initial_; // subinitials corresponding to each robot        
     gtsam::NonlinearFactorGraph innerEdges_; // edges involving keys from a single robot (exclude separator edges)
     std::vector<size_t>  separatorEdgeIds_; // for each robot stores the position of the factors corresponding to separator edges
     gtsam::Values neighbors_; // contains keys of all the neighboring robots
@@ -491,6 +722,11 @@ class DistributedMapper{
     double centralizedError_; // log it for plotting
     gtsam::Values centralizedValues_; // centralized estimate converted to the estimate format of this graph
     Verbosity verbosity_; // Verbosity level
+
+    gtsam::ISAM2 *isam_;
+    gtsam::NonlinearFactorGraph incGraph_;
+    gtsam::Values incInitial_;
+    int mark;
 };
 
 }

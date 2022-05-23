@@ -87,6 +87,7 @@ namespace distributed_mapper{
    * @brief pose3WithZeroTranslation sets to zero the translation part
    */
     gtsam::Values pose3WithZeroTranslation(gtsam::Values rotations);
+    gtsam::Values pose3WithZeroTranslation(gtsam::Values rotations, gtsam::Values initials);
 
 
     /** @brief initializeVectorValues use the keys from the input Values and set vector to zero(6) */
@@ -149,7 +150,7 @@ namespace distributed_mapper{
    * @param noise is shared noise model
    * @return converted noise
    */
-    gtsam::SharedNoiseModel convertToChordalNoise(gtsam::SharedNoiseModel noise, gtsam::Matrix Rhat = gtsam::Matrix::Identity(3, 3));
+    gtsam::SharedNoiseModel convertToChordalNoise(gtsam::SharedNoiseModel noise, gtsam::Matrix Rhat = gtsam::eye(3));
 
 
     /**
